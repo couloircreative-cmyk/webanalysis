@@ -20,7 +20,7 @@ app.add_middleware(
 class AnalysisRequest(BaseModel):
     url: str
 
-def crawl_site(start_url: u
+def crawl_site(start_url: str):
     parsed_start = urlparse(start_url)
     base_domain = parsed_start.netloc
     scheme = parsed_start.scheme
@@ -61,10 +61,6 @@ def crawl_site(start_url: u
                 pages_data.append({"url": current_url, "html": html, "size": size_kb})
 
                 soup = BeautifulSoup(html, 'html.parser')
-                # Extract internal links for crawling
-                for a_tag in soup.find_all('href' in a_tag.attrs or True and 'href' in [attr for attr in a_tag.attrs]):
-                    # safer link extraction
-                    pass
                 for a_tag in soup.find_all('a', href=True):
                     href = a_tag['href']
                     full_url = urljoin(start_url, href)
@@ -79,7 +75,6 @@ def crawl_site(start_url: u
         except Exception:
             continue
 
-    total_crawl_time = int((time.time() - start_time) * 1000)
     return pages_data, homepage_size_kb, homepage_load_time_ms
 
 @app.post("/analyze")
@@ -134,11 +129,9 @@ def analyze_website(payload: AnalysisRequest):
     # ==========================================
     # CRITERIA 2: Social Proof / Testimonials
     # ==========================================
-    # Broader keyword matching to ensure transparency on why points were given
     social_keywords = ['testimonial', 'review', 'what our clients say', 'customer feedback', 'rated 5 stars', 'success stories', 'trustpilot', 'case study', 'reviews', 'client results', 'endorsements']
     found_social = any(keyword in all_text for keyword in social_keywords)
     
-    # Check for review class elements or schema markup
     for page in pages:
         soup = BeautifulSoup(page['html'], 'html.parser')
         if soup.find_all(class_=re.compile("testimonial|review|rating|feedback|stars", re.I)):
