@@ -24,8 +24,13 @@ def crawl_site(start_url: str):
     parsed_start = urlparse(start_url)
     base_domain = parsed_start.netloc
 
+    # Enhanced headers to better mimic a real desktop browser
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive"
     }
 
     visited = set()
@@ -34,7 +39,6 @@ def crawl_site(start_url: str):
     total_internal_links_checked = 0
 
     urls_to_visit = [start_url]
-    start_time = time.time()
     homepage_load_time_ms = 0
     homepage_size_kb = 0
 
@@ -46,8 +50,11 @@ def crawl_site(start_url: str):
 
         try:
             req_start = time.time()
-            resp = requests.get(current_url, headers=headers, timeout=8)
+            # Increased timeout to 10 seconds for slower servers
+            resp = requests.get(current_url, headers=headers, timeout=10)
             req_time = int((time.time() - req_start) * 1000)
+
+            print(f"Crawled: {current_url} | Status: {resp.status_code}")
 
             if resp.status_code == 200:
                 html = resp.text
@@ -68,7 +75,6 @@ def crawl_site(start_url: str):
                     if parsed_link.netloc == base_domain:
                         if not any(ext in full_url.lower() for ext in ['.jpg', '.png', '.pdf', '.zip', '#', 'wp-admin', 'cart', 'checkout']):
                             total_internal_links_checked += 1
-                            # Check link health
                             try:
                                 link_resp = requests.head(full_url, headers=headers, timeout=4)
                                 if link_resp.status_code >= 400:
@@ -78,7 +84,8 @@ def crawl_site(start_url: str):
 
                             if full_url not in visited and full_url not in urls_to_visit:
                                 urls_to_visit.append(full_url)
-        except Exception:
+        except Exception as e:
+            print(f"Error crawling {current_url}: {str(e)}")
             continue
 
     return pages_data, homepage_size_kb, homepage_load_time_ms, broken_links_count, total_internal_links_checked
