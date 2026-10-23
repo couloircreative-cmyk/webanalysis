@@ -135,10 +135,12 @@ def analyze_website(payload: AnalysisRequest):
         c5_details = "No clear email or phone number detected."
 
     # ==========================================
-    # Overall Score (Weighted out of 100)
+    # Overall Score (True out of 100)
     # ==========================================
-    overall_score = int((c1_score * 10) + (c2_score * 10) + (c3_score * 10) + (c4_score * 20) + (c5_score * 20))
-
+    # Sum of scores (max 50) multiplied by 2 to get a true 0-100 scale
+    total_points = c1_score + c2_score + c3_score + c4_score + c5_score
+    overall_score = int((total_points / 50) * 100)
+    
     return {
         "url": url,
         "overallScore": overall_score,
