@@ -23,7 +23,6 @@ class AnalysisRequest(BaseModel):
 def crawl_site(start_url: str):
     parsed_start = urlparse(start_url)
     base_domain = parsed_start.netloc
-    scheme = parsed_start.scheme
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -31,15 +30,15 @@ def crawl_site(start_url: str):
 
     visited = set()
     pages_data = []
+    broken_links_count = 0
+    total_internal_links_checked = 0
 
-    # Queue of URLs to visit (limit to homepage + up to 6 internal links)
     urls_to_visit = [start_url]
-    
     start_time = time.time()
     homepage_load_time_ms = 0
     homepage_size_kb = 0
 
-    while urls_to_visit and len(visited) < 6:
+    while urls_to_visit and len(visited) < 10:
         current_url = urls_to_visit.pop(0)
         if current_url in visited:
             continue
@@ -66,16 +65,23 @@ def crawl_site(start_url: str):
                     full_url = urljoin(start_url, href)
                     parsed_link = urlparse(full_url)
                     
-                    # Only follow internal links
-                    if parsed_link.netloc == base_domain and full_url not in visited:
-                        # Skip anchor jumps, files, or login/admin pages
+                    if parsed_link.netloc == base_domain:
                         if not any(ext in full_url.lower() for ext in ['.jpg', '.png', '.pdf', '.zip', '#', 'wp-admin', 'cart', 'checkout']):
-                            if full_url not in urls_to_visit:
+                            total_internal_links_checked += 1
+                            # Check link health
+                            try:
+                                link_resp = requests.head(full_url, headers=headers, timeout=4)
+                                if link_resp.status_code >= 400:
+                                    broken_links_count += 1
+                            except:
+                                pass
+
+                            if full_url not in visited and full_url not in urls_to_visit:
                                 urls_to_visit.append(full_url)
         except Exception:
             continue
 
-    return pages_data, homepage_size_kb, homepage_load_time_ms
+    return pages_data, homepage_size_kb, homepage_load_time_ms, broken_links_count, total_internal_links_checked
 
 @app.post("/analyze")
 def analyze_website(payload: AnalysisRequest):
@@ -83,131 +89,160 @@ def analyze_website(payload: AnalysisRequest):
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
 
-    pages, page_size_kb, load_time_ms = crawl_site(url)
+    pages, page_size_kb, load_time_ms, broken_links, total_links = crawl_site(url)
 
     if not pages:
         raise HTTPException(status_code=400, detail="Could not reach or crawl the provided website URL.")
 
-    # Combine text and soups across all crawled pages for deep checks
     all_text = ""
     all_forms = []
     all_images = []
     has_meta_desc = False
+    has_viewport = False
+    has_og_tags = False
+    has_analytics = False
+    widget_indicators_found = 0
+    cta_found = False
 
+    combined_html_str = ""
     for page in pages:
-        soup = BeautifulSoup(page['html'], 'html.parser')
-        all_text += soup.get_text().lower() + " "
+        html = page['html']
+        combined_html_str += html + " "
+        soup = BeautifulSoup(html, 'html.parser')
+        page_text = soup.get_text().lower()
+        all_text += page_text + " "
+        
         all_forms.extend(soup.find_all('form'))
         all_images.extend(soup.find_all('img'))
         
-        # Check meta description on any page (prioritize homepage)
+        # Meta description
         meta_desc = soup.find('meta', attrs={'name': 'description'})
         if meta_desc and meta_desc.get('content', '').strip():
             has_meta_desc = True
 
+        # Viewport tag
+        if soup.find('meta', attrs={'name': 'viewport'}):
+            has_viewport = True
+
+        # Open Graph tags
+        if soup.find('meta', property=re.compile("^og:", re.I)):
+            has_og_tags = True
+
+        # Analytics / Tracking Pixels
+        if any(tracker in html.lower() for tracker in ['googletagmanager', 'gtag(', 'ga.js', 'facebookpixel', 'fbq(', 'hotjar', 'segment.js']):
+            has_analytics = True
+
+        # CTA buttons or keywords
+        buttons = soup.find_all(['button', 'a'], class_=re.compile("btn|button|cta", re.I))
+        for btn in buttons:
+            btn_txt = btn.get_text().lower()
+            if any(kw in btn_txt for kw in ['book', 'quote', 'schedule', 'consultation', 'get started', 'call', 'contact', 'estimate']):
+                cta_found = True
+
+        # Widgets & wizards
+        if soup.find_all(['iframe', 'embed'], src=re.compile("typeform|jotform|elfsight|hubspot|calendly|surveymonkey", re.I)):
+            widget_indicators_found += 1
+        if soup.find_all(class_=re.compile("wizard|step|multistep|multi-step|quiz|calculator|calc|questionnaire", re.I)):
+            widget_indicators_found += 1
+
     # ==========================================
-    # CRITERIA 1: Website Size & Speed
+    # 1. Size & Speed
     # ==========================================
     size_score = 10
-    if page_size_kb > 4000:
-        size_score = max(2, 10 - int((page_size_kb - 4000) / 1000))
-    elif page_size_kb > 2000:
-        size_score = 7
-    elif page_size_kb > 1000:
-        size_score = 9
+    if page_size_kb > 4000: size_score = max(2, 10 - int((page_size_kb - 4000) / 1000))
+    elif page_size_kb > 2000: size_score = 7
+    elif page_size_kb > 1000: size_score = 9
 
-    speed_score = 10
-    if load_time_ms > 3000:
-        speed_score = 4
-    elif load_time_ms > 1500:
-        speed_score = 7
-
+    speed_score = 10 if load_time_ms <= 1500 else (7 if load_time_ms <= 3000 else 4)
     c1_score = int((size_score + speed_score) / 2)
     c1_details = f"Homepage size: {page_size_kb:.1f} KB. Response load time: {load_time_ms}ms across {len(pages)} crawled page(s)."
-    c1_suggestion = "Optimize high-resolution images, enable browser caching, and minimize heavy third-party scripts to improve speed." if c1_score < 8 else "Great load time and clean page weight."
+    c1_suggestion = "Optimize images and minimize third-party scripts to boost speed." if c1_score < 8 else "Great load time and clean page weight."
 
     # ==========================================
-    # CRITERIA 2: Social Proof / Testimonials
+    # 2. Social Proof & Reviews
     # ==========================================
-    social_keywords = ['testimonial', 'review', 'what our clients say', 'customer feedback', 'rated 5 stars', 'success stories', 'trustpilot', 'case study', 'reviews', 'client results', 'endorsements']
-    found_social = any(keyword in all_text for keyword in social_keywords)
-    
-    for page in pages:
-        soup = BeautifulSoup(page['html'], 'html.parser')
-        if soup.find_all(class_=re.compile("testimonial|review|rating|feedback|stars", re.I)):
-            found_social = True
-            break
-
+    social_keywords = ['testimonial', 'review', 'what our clients say', 'customer feedback', 'rated 5 stars', 'success stories', 'trustpilot', 'case study', 'reviews', 'client results', 'elfsight']
+    found_social = any(kw in all_text for kw in social_keywords)
     c2_score = 10 if found_social else 3
-    c2_details = "Social proof elements, review mentions, or case studies found across the crawled pages." if found_social else "No explicit reviews, testimonials, or trust badges detected in page text or CSS classes."
-    c2_suggestion = "Your social proof elements were successfully detected!" if found_social else "Add a dedicated section for client testimonials, video reviews, or star ratings to build immediate trust with visitors."
+    c2_details = "Social proof elements or reviews found across crawled pages." if found_social else "No explicit reviews, testimonials, or trust badges detected."
+    c2_suggestion = "Add client testimonials or star ratings to build immediate trust." if c2_score < 8 else "Social proof elements successfully detected."
 
     # ==========================================
-    # CRITERIA 3: Forms & Quiz/Multi-step Detection
+    # 3. Forms, Quizzes & Multi-step
     # ==========================================
     form_count = len(all_forms)
-    form_text = "".join([str(f).lower() for f in all_forms]) + all_text
-    is_multi_step = any(kw in form_text for kw in ['step 1', 'quiz', 'multi-step', 'multistep', 'questionnaire', 'progress-bar', 'multi_step'])
-    
-    if form_count == 0:
-        c3_score = 2
-        c3_details = "No interactive forms found across crawled pages."
-        c3_suggestion = "Add an interactive lead capture form or multi-step quote calculator to convert visitors into leads."
-    elif is_multi_step or form_count >= 2:
-        c3_score = 10
-        c3_details = f"Found {form_count} form(s) including multi-step or quiz functionality across the site."
-        c3_suggestion = "Advanced interactive forms detected, which are great for user engagement."
+    is_multi_step = any(kw in all_text for kw in ['step 1', 'quiz', 'multi-step', 'multistep', 'questionnaire', 'wizard', 'calculator'])
+    if form_count == 0 and widget_indicators_found == 0:
+        c3_score, c3_details, c3_suggestion = 2, "No interactive forms found.", "Add an interactive lead capture form or calculator."
+    elif is_multi_step or widget_indicators_found > 0 or form_count >= 2:
+        c3_score, c3_details, c3_suggestion = 10, f"Advanced forms/quizzes detected ({form_count} form(s), {widget_indicators_found} widget(s)).", "Interactive forms are well configured."
     else:
-        c3_score = 7
-        c3_details = f"Found {form_count} standard single-step form(s)."
-        c3_suggestion = "Consider splitting long contact forms into a 2-step or quiz format to increase conversion rates."
+        c3_score, c3_details, c3_suggestion = 7, f"Found {form_count} standard form(s).", "Consider splitting long forms into a multi-step wizard."
 
     # ==========================================
-    # CRITERIA 4: SEO (Alt Text & Meta Descriptions)
+    # 4. SEO Quality (Alt Text & Meta)
     # ==========================================
     total_images = len(all_images)
     images_with_alt = sum(1 for img in all_images if img.get('alt', '').strip())
     alt_ratio = (images_with_alt / total_images) if total_images > 0 else 1.0
-    
-    seo_score_parts = 0
-    if has_meta_desc: 
-        seo_score_parts += 5
-    seo_score_parts += int(alt_ratio * 5)
-    c4_score = max(1, seo_score_parts)
-    c4_details = f"Meta description found: {'Yes'}. Image Alt Text coverage: {images_with_alt}/{total_images} images across site." if has_meta_desc else f"Meta description missing on key pages. Alt text coverage: {images_with_alt}/{total_images}."
-    c4_suggestion = "Ensure every page has a unique meta description and every image includes descriptive alt text for better search rankings." if c4_score < 8 else "Solid SEO fundamentals with meta tags and image alt attributes properly configured."
+    c4_score = max(1, (5 if has_meta_desc else 0) + int(alt_ratio * 5))
+    c4_details = f"Meta description: {'Present'}. Alt text coverage: {images_with_alt}/{total_images} images."
+    c4_suggestion = "Ensure all images have alt attributes and every page has a unique meta description." if c4_score < 8 else "SEO metadata and image tags properly configured."
 
     # ==========================================
-    # CRITERIA 5: Contact Info (Email & Phone)
+    # 5. Contact Info (Email & Phone)
     # ==========================================
-    combined_html_str = "".join([p['html'] for p in pages])
     email_pattern = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
     phone_pattern = r"(\+\d{1,2}\s?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}"
-    
-    found_emails = re.findall(email_pattern, combined_html_str)
-    found_phones = re.findall(phone_pattern, combined_html_str)
-    
-    has_email = len(found_emails) > 0 or any('mailto:' in p['html'] for p in pages)
-    has_phone = len(found_phones) > 0 or any('tel:' in p['html'] for p in pages)
+    has_email = len(re.findall(email_pattern, combined_html_str)) > 0 or 'mailto:' in combined_html_str
+    has_phone = len(re.findall(phone_pattern, combined_html_str)) > 0 or 'tel:' in combined_html_str
     
     if has_email and has_phone:
-        c5_score = 10
-        c5_details = "Email address and phone number detected across the site."
-        c5_suggestion = "Contact information is easily accessible."
+        c5_score, c5_details, c5_suggestion = 10, "Email and phone contact info detected.", "Contact info is easily accessible."
     elif has_email or has_phone:
-        c5_score = 6
-        c5_details = "Partial contact info detected (either email or phone only)."
-        c5_suggestion = "Add both a direct phone number and an email address in your header or footer to maximize customer trust."
+        c5_score, c5_details, c5_suggestion = 6, "Partial contact info detected.", "Include both a direct phone number and email address."
     else:
-        c5_score = 2
-        c5_details = "No clear email address or phone number detected."
-        c5_suggestion = "Include clickable phone (`tel:`) and email (`mailto:`) links in your footer so prospective clients can reach you instantly."
+        c5_score, c5_details, c5_suggestion = 2, "No clear email or phone number found.", "Add clickable phone and email links in your footer."
 
     # ==========================================
-    # Overall Score (True out of 100)
+    # 6. Analytics & Tracking Pixels
     # ==========================================
-    total_points = c1_score + c2_score + c3_score + c4_score + c5_score
-    overall_score = int((total_points / 50) * 100)
+    c6_score = 10 if has_analytics else 2
+    c6_details = "Analytics or tracking pixels (GA4, GTM, Meta Pixel) detected." if has_analytics else "No tracking pixels or analytics tags found."
+    c6_suggestion = "Install Google Tag Manager or GA4 to track visitor traffic and conversions." if c6_score < 8 else "Analytics tracking properly installed."
+
+    # ==========================================
+    # 7. Open Graph / Social Sharing Tags
+    # ==========================================
+    c7_score = 10 if has_og_tags else 3
+    c7_details = "Open Graph social meta tags (`og:title`, `og:image`) found." if has_og_tags else "Missing Open Graph social sharing tags."
+    c7_suggestion = "Add OG meta tags so your links preview correctly when shared on social media or text messages." if c7_score < 8 else "Social sharing preview tags properly configured."
+
+    # ==========================================
+    # 8. Call-to-Action (CTA) Prominence
+    # ==========================================
+    c8_score = 10 if cta_found else 4
+    c8_details = "High-intent call-to-action buttons/links detected." if cta_found else "No clear high-intent CTA buttons found."
+    c8_suggestion = "Add prominent action buttons like 'Book a Call' or 'Get a Quote' above the fold." if c8_score < 8 else "Strong call-to-action buttons present."
+
+    # ==========================================
+    # 9. Mobile Viewport Meta Tag
+    # ==========================================
+    c9_score = 10 if has_viewport else 1
+    c9_details = "Mobile viewport meta tag present." if has_viewport else "Mobile viewport meta tag missing."
+    c9_suggestion = "Add `<meta name='viewport' content='width=device-width, initial-scale=1.0'>` to ensure mobile compatibility." if c9_score < 8 else "Mobile viewport configured correctly."
+
+    # ==========================================
+    # 10. Link Health
+    # ==========================================
+    c10_score = 10 if broken_links == 0 else max(3, 10 - (broken_links * 2))
+    c10_details = f"Checked {total_links} internal links. Broken links found: {broken_links}."
+    c10_suggestion = "Fix or redirect broken internal links to improve user experience and SEO." if c10_score < 8 else "All checked internal links are healthy."
+
+    # ==========================================
+    # Overall Score (True out of 100 across 10 pillars)
+    # ==========================================
+    overall_score = c1_score + c2_score + c3_score + c4_score + c5_score + c6_score + c7_score + c8_score + c9_score + c10_score
 
     return {
         "url": url,
@@ -217,6 +252,11 @@ def analyze_website(payload: AnalysisRequest):
             "socialProof": {"score": c2_score, "details": c2_details, "suggestion": c2_suggestion},
             "formsAndQuizzes": {"score": c3_score, "details": c3_details, "suggestion": c3_suggestion},
             "seoQuality": {"score": c4_score, "details": c4_details, "suggestion": c4_suggestion},
-            "contactInfo": {"score": c5_score, "details": c5_details, "suggestion": c5_suggestion}
+            "contactInfo": {"score": c5_score, "details": c5_details, "suggestion": c5_suggestion},
+            "analyticsPixels": {"score": c6_score, "details": c6_details, "suggestion": c6_suggestion},
+            "openGraphTags": {"score": c7_score, "details": c7_details, "suggestion": c7_suggestion},
+            "ctaProminence": {"score": c8_score, "details": c8_details, "suggestion": c8_suggestion},
+            "mobileViewport": {"score": c9_score, "details": c9_details, "suggestion": c9_suggestion},
+            "linkHealth": {"score": c10_score, "details": c10_details, "suggestion": c10_suggestion}
         }
     }
